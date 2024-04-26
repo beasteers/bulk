@@ -13,8 +13,6 @@ from wasabi import msg
 
 from bulk._bokeh_utils import read_file, save_file
 from bulk.cli.download import download_fruits, download_pets, download_twemoji
-from bulk.cli.image import bulk_images
-from bulk.cli.text import bulk_text
 
 cli = Radicli(help="Bulk: Tools for bulk labelling.")
 
@@ -33,6 +31,8 @@ def text(
     download: bool = False,
 ):
     """Bulk labelling interface for text."""
+    from bulk.cli.text import bulk_text
+
     if not path.exists():
         msg.fail(f"Path {str(path)} does not exist.", exits=True, spaced=True)
     if keywords:
@@ -50,6 +50,43 @@ def text(
 
 
 @cli.command(
+    "time",
+    path=Arg(help="path to .csv files"),
+    data_dir=Arg(help="path to a directory of .csv files"),
+    labels=Arg("--labels", help="comma seperated string of terms to highlight"),
+    port=Arg("--port", help="port number"),
+    download=Arg("--download", help="save button turns into download button"),
+)
+def time(
+    path: Path,
+    data_dir: Path,
+    labels: str = None,
+    port: int = 5006,
+    download: bool = False,
+):
+    """Bulk labelling interface for time series."""
+    from bulk.cli.time import bulk_time
+
+    if not path.exists():
+        msg.fail(f"Path {str(path)} does not exist.", exits=True, spaced=True)
+    if not data_dir.exists():
+        msg.fail(f"Path {str(data_dir)} does not exist.", exits=True, spaced=True)
+    
+    if labels:
+        labels = labels.split(",")
+    server = Server(
+        {"/": bulk_time(path, data_dir, download=download)},
+        io_loop=IOLoop(),
+        port=port,
+        websocket_max_message_size=64 * 1024 * 1024,
+    )
+    server.start()
+    host = f"http://localhost:{port}/"
+    msg.good(f"About to serve `bulk` over at {host}.", spaced=True)
+    server.io_loop.add_callback(view, host)
+    server.io_loop.start()
+
+@cli.command(
     "image",
     path=Arg(help="path to .csv/.jsonl file"),
     port=Arg("--port", help="port number"),
@@ -61,6 +98,8 @@ def image(
     download: bool = False,
 ):
     """Bulk labelling interface for images."""
+    from bulk.cli.image import bulk_images
+
     if not path.exists():
         msg.fail(f"Path {str(path)} does not exist.", exits=True, spaced=True)
     server = Server(
