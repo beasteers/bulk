@@ -227,12 +227,12 @@ def bulk_time(path, data_path, output_path='event_output.csv', labels=LABELS, do
 
         def update_labels(attr, old, new):
             print("update labels", new)
-            active_view.filter = multi_group_filter("label", new)
+            active_view.filter.operands = [GroupFilter(column_name='label', group=x) for x in new] if len(new) else [AllIndices()]
             # active_view.filter.booleans = event_df.label.isin(new) if len(new) else None
             # db_refresh_tabs(attr, old, new)
             tab_group.tabs = starter_tabs
 
-        label_select = MultiChoice(title="Selectable Labels:", value=['?'], options=[*labels, '?'])
+        label_select = MultiChoice(title="Selectable Labels:", value=['?'], options=[*labels])
         label_select.on_change('value', update_labels)
         active_view.filter = multi_group_filter("label", ['?'])
 
@@ -352,6 +352,8 @@ def time_series_plot(df, event, labels):
     start_time = pd.to_datetime(event['start_time']).to_pydatetime() - timedelta(minutes=5)
     end_time = pd.to_datetime(event['end_time']).to_pydatetime() + timedelta(minutes=5)
     dfi = df.loc[event['deployment_id']].loc[start_time:end_time]
+
+
 
     # Create the plot with two lines: depth_filt_mm and depth_proc_mm
     p = figure(
