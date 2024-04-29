@@ -69,8 +69,8 @@ def time(
 
     if not path.exists():
         msg.fail(f"Path {str(path)} does not exist.", exits=True, spaced=True)
-    if not data_dir.exists():
-        msg.fail(f"Path {str(data_dir)} does not exist.", exits=True, spaced=True)
+    # if not data_dir.exists():
+    #     msg.fail(f"Path {str(data_dir)} does not exist.", exits=True, spaced=True)
     
     if labels:
         labels = labels.split(",")

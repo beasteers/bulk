@@ -9,6 +9,8 @@ __pycache__/
 *.parquet
 *.npz
 
+shhh/
+
 # Distribution / packaging
 .Python
 build/

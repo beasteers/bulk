@@ -1,0 +1,127 @@
+:host {
+    --light-background: #a99fff32;
+    --mid-background: #a99fff62;
+    /* --semisolid-background: #cbc5ffe8; */
+    --active-background: #aa17d447;
+    --mid-shadow: #876291;
+    --color-primary: #1152ff;
+    --color-success: #00ab39;
+    --color-warning: #ef9f00;
+    --color-danger: #ff1141;
+}
+
+/* body {
+    background-color: black;
+    color: white;
+} */
+
+
+:host .bk-active {
+    background-color: var(--mid-background);
+}
+
+:host(.bk-MultiChoice) .choices__inner, :host(.bk-Select) select {
+    border-width: 0;
+    background-color: var(--light-background);
+    color: inherit;
+}
+:host(.bk-MultiChoice) .choices__inner .choices__item.solid {
+    background-color: var(--mid-background);
+    color: inherit;
+}
+:host(.bk-MultiChoice) .choices__list--dropdown {
+    background-color: var(--light-background);
+    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(5px);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+}
+:host(.bk-MultiChoice) .choices__list--dropdown .choices__item--selectable.is-highlighted, .choices__list[aria-expanded] .choices__item--selectable.is-highlighted {
+    background-color: var(--light-background);
+}
+
+:host(.bk-DataTable) .slick-row.odd {
+    background-color: var(--light-background);
+}
+:host(.bk-DataTable) .slick-row.even, 
+:host(.bk-DataTable) .bk-cell-select {
+    background-color: transparent;
+}
+:host(.bk-DataTable) .slick-header-column:hover, 
+:host(.bk-DataTable) .slick-header-column-active {
+    background-color: var(--mid-background);
+}
+:host(.bk-DataTable) .slick-header-column, 
+:host(.bk-DataTable) .slick-group-header-column {
+    border-width: 0;
+}
+:host(.bk-DataTable) .slick-cell.selected {
+    background-color: var(--mid-background);
+}
+
+
+:host(.bk-DateRangeSlider) .noUi-handle {
+    background-color: var(--light-background) !important;
+}
+:host(.bk-DateRangeSlider) .noUi-target {
+    background-color: var(--light-background) !important;
+    border-width: 0;
+    box-shadow: none;
+    /* box-shadow: inset 0 1px 1px var(--mid-background), 0 3px 6px -5px var(--light-background); */
+}
+:host(.bk-DateRangeSlider) .noUi-connects .noUi-connect {
+    background-color: var(--mid-background) !important;
+}
+
+
+:host .bk-btn {
+    border-width: 0;
+    outline: 0px;
+    color: inherit;
+    transition: background-color 0.1s ease-in-out;
+}
+:host .bk-btn-primary {
+    background-color: var(--color-primary);
+    color: white;
+}
+:host .bk-btn-success {
+    background-color: var(--color-success);
+    color: white;
+}
+:host .bk-btn-warning {
+    background-color: var(--color-warning);
+    color: white;
+}
+:host .bk-btn-default {
+    background-color: var(--light-background);
+}
+
+:host(.bk-RadioButtonGroup) .bk-btn {
+    /* background-color: var(--light-background); */
+    border-width: 0;
+    outline: 0px;
+    transition: background-color 0.1s ease-in-out;
+    color: inherit;
+    outline: none;
+}
+
+
+:host(.bk-RadioButtonGroup) .bk-btn-default {
+    background-color: var(--light-background);
+}
+
+:host(.bk-RadioButtonGroup) .bk-active {
+    background-color: var(--mid-background);
+}
+
+:host(.bk-Tabs) .bk-header {
+    border-color: var(--mid-background);
+}
+
+
+:host(.bk-Tabs) .bk-tab.bk-active {
+    color: inherit;
+    background-color: transparent;
+    border-color: var(--mid-background);
+}
+

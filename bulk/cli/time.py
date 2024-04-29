@@ -1,5 +1,6 @@
 import os
 from datetime import timedelta, datetime
+from turtle import width
 import tqdm
 from pathlib import Path
 import numpy as np
@@ -8,20 +9,24 @@ from bokeh.io import curdoc
 from bokeh.layouts import column, row
 from bokeh.models import (
     Button, ColorBar, ColumnDataSource, CustomJS,
-    DataTable, TableColumn, TextInput, 
+    DataTable, TableColumn, TextInput, DataCube,
+    SumAggregator, GroupingInfo, DateFormatter, StringFormatter,
     RadioButtonGroup, DateRangeSlider,
     TabPanel, Tabs, MultiChoice,
     Select, Div,
-    LassoSelectTool,
+    LassoSelectTool, RangeTool, PolyAnnotation,
     BooleanFilter, IndexFilter, IntersectionFilter, UnionFilter, AllIndices, InversionFilter, GroupFilter, SymmetricDifferenceFilter,
     CDSView,
+    GlobalInlineStyleSheet, InlineStyleSheet,
 )
 from bokeh.palettes import Category10, Cividis256
 from bokeh.transform import factor_cmap, linear_cmap
 from bokeh.plotting import figure
+from bokeh.themes import Theme
 from wasabi import msg
 
 from bulk._bokeh_utils import download_js_code, read_file, save_file
+from bulk.cli.custom.graphql_datasource import GraphQLDataSource
 
 
 OUTPUT_COLUMNS = [
@@ -30,6 +35,28 @@ OUTPUT_COLUMNS = [
 ]
 
 LABELS = ['flood', 'blip', 'pulse-chain', 'box', 'snow', 'misc', 'probable-noise', 'probable-flood', '?']
+
+TIME_QUERY_CONFIG = {
+    "url": "https://api.dev.floodlabs.nyc/v1/graphql",
+    # "url": "http://localhost:8080/v1/graphql",
+    "query": """
+query TimeSeriesData(
+        $deployment_id: String!,
+        $start_time: timestamptz!,
+        $end_time: timestamptz!
+) {
+    depth_data(where: {
+        deployment_id: { _eq: $deployment_id },
+        time: { _gt: $start_time, _lt: $end_time },
+    }, order_by: {time: asc}) {
+        time
+        depth_filt_mm
+        depth_proc_mm
+        deployment_id
+    }
+}
+""",
+}
 
 def debounce(wait):
     def wrap(fn):
@@ -81,14 +108,51 @@ def multi_group_filter(column, values):
 
 def bulk_time(path, data_path, output_path='event_output.csv', labels=LABELS, download=True):
     print("Loading data parquet")
-    data_df = pd.read_parquet(data_path)
+    data_df = None #pd.read_parquet(data_path)
     # data_df['time'] = pd.to_datetime(data_df['time'], format='ISO8601').dt.tz_localize(None)
     # if input('>?'):from IPython import embed;embed()
     # data_df = data_df.dropna(subset=['deployment_id'])
-    print("Loaded.", data_df.shape)
+    # print("Loaded.", data_df.shape)
 
     current_session = datetime.now().strftime("%y-%m-%d")
     def bkapp(doc):
+        doc.title = "FloodNet Annotator"
+        css = open(os.path.join(os.path.dirname(__file__), 'theme.css')).read()
+        stylesheet = GlobalInlineStyleSheet(css=css)
+        doc.theme = Theme(
+            json={'attrs': {
+                'UIElement': {'stylesheets': [InlineStyleSheet(css=css)]},
+                # "Plot": {
+                #     "background_fill_color": "#a99fff32",
+                #     "border_fill_color": "#15191C",
+                #     "outline_line_color": "#00000000",
+                #     "outline_line_alpha": 0,
+                # },
+                # "Legend": {
+                #     "label_text_color": "#E0E0E0",
+                #     "background_fill_color": "#a99fff32",
+                # },
+                # "Grid": {
+                #     "grid_line_color": "#E0E0E0",
+                #     "grid_line_alpha": 0.25,
+                # },
+                # "Axis": {
+                #     "major_tick_line_color": "#E0E0E0",
+                #     "minor_tick_line_color": "#E0E0E0",
+                #     "axis_line_color": "#E0E0E0",
+                #     "major_label_text_color": "#E0E0E0",
+                #     "axis_label_text_color": "#E0E0E0",
+                # },
+                # "BaseColorBar": {
+                #     "title_text_color": "#E0E0E0",
+                #     "major_label_text_color": "#E0E0E0",
+                #     "background_fill_color": "#a99fff32",
+                # },
+                # "Title": {
+                #     "text_color": "#E0E0E0",
+                # },
+            }},
+        )
         nonlocal labels
         # event_df, colormap, orig_cols = read_file(path)
         # event_df = pd.read_csv(path)
@@ -105,6 +169,7 @@ def bulk_time(path, data_path, output_path='event_output.csv', labels=LABELS, do
         event_df['start_time'] = pd.to_datetime(event_df['start_time'], format='ISO8601').dt.tz_localize(None)
         event_df['end_time'] = pd.to_datetime(event_df['end_time'], format='ISO8601').dt.tz_localize(None)
         event_df['label'] = event_df['label'].fillna('?')
+        event_df['count'] = 1
         print("starting with", event_df.shape)
         event_df = event_df.dropna(subset=['deployment_id'])
         print("dropping non-deployments", event_df.shape)
@@ -112,47 +177,137 @@ def bulk_time(path, data_path, output_path='event_output.csv', labels=LABELS, do
         if labels is None:
             labels = event_df.label.unique().tolist()
 
+        # -------------------------------- Data Source ------------------------------- #
+
         source = ColumnDataSource(data=event_df)
-        deployment_id_filter = UnionFilter(operands=[AllIndices()])
+        # deployment_id_filter = UnionFilter(operands=[AllIndices()])
+        deployment_id_filter = BooleanFilter()
         date_filter = BooleanFilter()
         select_filter = IndexFilter()
-        filter_view = CDSView(filter=deployment_id_filter & date_filter)
+        label_filter = UnionFilter(operands=[AllIndices()])
+        filter_view = CDSView(filter=deployment_id_filter & date_filter & label_filter)
         selection_view = CDSView(filter=select_filter & filter_view.filter)
         active_view = CDSView(filter=BooleanFilter())
+
+        # ---------------------------- Summary Data Table ---------------------------- #
         
+        # data_table = DataTable(
+        #     source=source, 
+        #     columns=[
+        #         TableColumn(field=c, title=c)
+        #         for c in event_df.columns
+        #         if c not in ['x', 'y', 'color', 'alpha']
+        #     ], 
+        #     view=selection_view, 
+        #     selectable=False, # TODO
+        #     # width=750 if "color" in event_df.columns else 800,
+        #     sizing_mode='stretch_both',
+        # )
+        columns = [
+            TableColumn(field="deployment_id", title="Name"),
+            TableColumn(field="label", title="Label"),
+            TableColumn(field="start_time", title="Start", formatter=DateFormatter()),
+            TableColumn(field="end_time", title="End", formatter=DateFormatter()),
+            # TableColumn(field="annotated_by", title="Annotator"),
+            # TableColumn(field=c, title=c)
+            # for c in event_df.columns
+            # if c not in ['x', 'y', 'color', 'alpha']
+        ]
         data_table = DataTable(
             source=source, 
-            columns=[
-                TableColumn(field=c, title=c)
-                for c in event_df.columns
-                if c not in ['x', 'y', 'color', 'alpha']
+            columns=columns + [
+                TableColumn(field=c, title=c.replace('_',' ')) for c in event_df.columns if c not in ([c.field for c in columns] + ['x', 'y', 'z', 'color', 'alpha']) and not any(c.endswith(p) for p in ['_x', '_y', '_z'])
             ], 
             view=selection_view, 
             selectable=False, # TODO
-            # width=750 if "color" in event_df.columns else 800,
-            sizing_mode='stretch_width',
+            sizing_mode='stretch_both',
+            index_position=None,
+            
         )
+        # data_table = DataCube(
+        #     source=source, 
+        #     view=selection_view, 
+        #     selectable=False, # TODO
+        #     sizing_mode='stretch_both',
+        #     # columns=[
+        #     #     TableColumn(field='deployment_id', title='Name', width=80),
+        #     #     # TableColumn(field='label', title='Label', width=40),
+        #     # ],
+        #     columns=[
+        #         TableColumn(field=c, title=c)
+        #         for c in event_df.columns
+        #         if c not in ['x', 'y', 'color', 'alpha']
+        #     ], 
+        #     grouping=[
+        #         GroupingInfo(getter='deployment_id', aggregators=[SumAggregator(field_='count')]),
+        #         GroupingInfo(getter='label', aggregators=[SumAggregator(field_='count')]),
+        #     ],
+        #     target=ColumnDataSource(data=dict(row_indices=[], labels=[])),
+        # )
 
-        highlighted_idx = []
+        # -------------------------------- Date filter ------------------------------- #
+
+        def update_date(attr, old, new):
+            x = date_range_slider.value_as_datetime
+            print("update date", x)
+            if x is None: 
+                date_filter.booleans = None
+                return 
+            start_time, end_time = x
+            date_filter.booleans = (event_df.start_time >= np.datetime64(start_time)) & (event_df.start_time <= np.datetime64(end_time))
+            tab_group.tabs = starter_tabs
+
+        time_min = event_df['start_time'].min().date()
+        time_max = (event_df['end_time'].max() + timedelta(days=1)).date()
+        date_range_slider = DateRangeSlider(value=(time_min, time_max), start=time_min, end=time_max, styles={'flex-grow': '1'})
+        date_range_slider.on_change('value_throttled', update_date)
+
+        # ------------------------------ Label Selection ----------------------------- #
+
+        def update_select_labels(attr, old, new):
+            print("update labels", new)
+            active_view.filter.operands = [GroupFilter(column_name='label', group=x) for x in new] if len(new) else [AllIndices()]
+            tab_group.tabs = starter_tabs
+
+        label_select = MultiChoice(title="Selectable Labels:", value=['?'], options=[*labels])
+        label_select.on_change('value', update_select_labels)
+        active_view.filter = multi_group_filter("label", ['?'])
+
+        def update_show_labels(attr, old, new):
+            print("update labels", new)
+            label_filter.operands = [GroupFilter(column_name='label', group=x) for x in new] if len(new) else [AllIndices()]
+            tab_group.tabs = starter_tabs
+
+        label_show = MultiChoice(title="Visible Labels:", value=[], options=[*labels])
+        label_show.on_change('value', update_show_labels)
+
+        # ----------------------------------- Tabs ----------------------------------- #
+
+        def refresh_tabs(attr, old, new):
+            print("refreshing tabs")
+            df = source.to_df()
+            i = get_filter_mask(active_view.filter & selection_view.filter, df)
+            df = df.loc[i]
+            tab_group.tabs = [
+                TabPanel(child=get_time_series_tab(data_df, fdf, labels, save_df), title=f'{label} ({len(fdf)})')
+                for label, fdf in df.groupby('label')
+            ] + data_tabs
+
+        data_tabs = [TabPanel(child=column(data_table, sizing_mode='stretch_height', width=600), title='data')]
+        starter_tabs = [TabPanel(child=data_table, title='please select points on the scatter plot')]
+        tab_group = Tabs(tabs=starter_tabs, sizing_mode='stretch_width', max_height=1000, height=1000)
+
+        # ---------------------------------- Actions --------------------------------- #
+
         @debounce(0.5)
         def update_selection(attr, old, new):
             """Callback used for plot update when lasso selecting"""
             print("update selection", len(new))
             select_filter.indices = new if len(new) else None
-            highlighted_idx[:] = new
             if len(new):
                 refresh_tabs(attr, old, new)
             else:
                 tab_group.tabs = starter_tabs
-
-        # def save():
-        #     """Callback used to save highlighted data points"""
-        #     save_file(
-        #         dataf=event_df,
-        #         highlighted_idx=highlighted_idx,
-        #         filename=text_filename.value,
-        #         orig_cols=orig_cols,
-        #     )
 
         def save_df(mod_df):
             mod_df = mod_df.copy()[OUTPUT_COLUMNS]
@@ -199,72 +354,46 @@ def bulk_time(path, data_path, output_path='event_output.csv', labels=LABELS, do
             
             mod_df.to_csv(output_path, index=False)
 
-        def refresh_tabs(attr, old, new):
-            print("refreshing tabs")
-            df = source.to_df()
-            i = get_filter_mask(active_view.filter & selection_view.filter, df)
-            df = df.loc[i]
-            tab_group.tabs = [
-                TabPanel(child=get_time_series_tab(data_df, fdf, labels, save_df), title=f'{label} ({len(fdf)})')
-                for label, fdf in df.groupby('label')
-            ] + [TabPanel(child=data_table, title='data')]
-        db_refresh_tabs = debounce(0.2)(refresh_tabs)
-
-        def update_date(attr, old, new):
-            x = date_range_slider.value_as_datetime
-            print("update date", x)
-            if x is None: 
-                date_filter.booleans = None
-                return 
-            start_time, end_time = x
-            date_filter.booleans = (event_df.start_time >= np.datetime64(start_time)) & (event_df.start_time <= np.datetime64(end_time))
-            tab_group.tabs = starter_tabs
-
-        time_min = event_df['start_time'].min().date()
-        time_max = (event_df['end_time'].max() + timedelta(days=1)).date()
-        date_range_slider = DateRangeSlider(value=(time_min, time_max), start=time_min, end=time_max)
-        date_range_slider.on_change('value_throttled', update_date)
-
-        def update_labels(attr, old, new):
-            print("update labels", new)
-            active_view.filter.operands = [GroupFilter(column_name='label', group=x) for x in new] if len(new) else [AllIndices()]
-            # active_view.filter.booleans = event_df.label.isin(new) if len(new) else None
-            # db_refresh_tabs(attr, old, new)
-            tab_group.tabs = starter_tabs
-
-        label_select = MultiChoice(title="Selectable Labels:", value=['?'], options=[*labels])
-        label_select.on_change('value', update_labels)
-        active_view.filter = multi_group_filter("label", ['?'])
-
-        starter_tabs = [TabPanel(child=data_table, title='please select points on the scatter plot')]
-        tab_group = Tabs(tabs=starter_tabs, sizing_mode='stretch_width', max_height=1000, height=1000)
-        # doc.add_timeout_callback(lambda: refresh_tabs(None, None, []), 100)
-        # db_refresh_tabs(None, None, [])
+        # ---------------------------- Embedding Explorer ---------------------------- #
 
         options, p = embedding_plot(event_df, source, filter_view, active_view, labels, update_selection)
-        stat_table = stats_table(event_df, deployment_id_filter)
+
+        # -------------------------------- Stats Table ------------------------------- #
+
+        stat_table = stats_table(event_df, source, deployment_id_filter)
         # text_filename, save_btn = file_download(source, save, download)
+
+        # ----------------------------------- Page ----------------------------------- #
+
         print("Fin.")
         return doc.add_root(column(
-            row(*options.children, date_range_slider, label_select),
+            row(
+                *options.children, date_range_slider, label_select, label_show,
+                sizing_mode='stretch_width',
+                styles={
+                    'align-items': 'flex-end',
+                    'padding': '0.1em 0.4em',
+                    # 'width': 'auto',
+                },
+            ),
             row(
                 column(
                     p,
                     stat_table,
                     sizing_mode="stretch_width",
+                    # resizable='width',
                 ), 
                 tab_group,
-                sizing_mode='stretch_width',
+                sizing_mode='stretch_both',
+                # styles={
+                #     'flex': 'stretch',
+                # }
             ),
-            # Div(text="""
-            # <style>
-            # .scrollable{
-            # overflow: auto;
-            # max-height: 100vh;
-            # }
-            # </style>
-            # """),
             sizing_mode='stretch_both',
+            styles={
+                'align-items': 'stretch',
+            }, 
+            stylesheets=[stylesheet]
         ))
 
     return bkapp
@@ -273,45 +402,33 @@ def bulk_time(path, data_path, output_path='event_output.csv', labels=LABELS, do
 def get_time_series_tab(df, filt_df, labels, save, page_size=35):
     c = column(
         sizing_mode='stretch_width',
-        max_height=1000,
-        height=1000,
-        # css_classes=['scrollable'],
-        styles={'overflow': 'auto', 'max-height': '80vh'}
+        styles={
+            'overflow': 'auto', 
+            'flex': '1 1',
+        }
     )
 
     # filt_df = filt_df.sample(frac=1)
-    print(df.shape, filt_df.shape)
+    print(filt_df.shape)
 
     page = 0
     n_total = int(np.ceil(len(filt_df) / page_size))
-    # page_df = None
     def set_page(new):
         nonlocal page #, page_df
         page = min(max(0, new), n_total)
-        # page_df = filt_df.iloc[page*page_size:(page+1)*page_size].copy()
         next_button.label = f"skip ({page+1}/{n_total})"
         refresh_plots()
 
-    def prev_click():
-        set_page(page-1)
-    def next_click():
-        set_page(page+1)
-    def save_click():
-        commit_values()
-        save(filt_df.iloc[page*page_size:(page+1)*page_size])
-        set_page(page+1)
-
     def refresh_plots():
         c.children = [
-            time_series_plot(df, event, labels)
+            ajax_time_series_plot(df, event, labels)
             for _, event in filt_df.iloc[page*page_size:(page+1)*page_size].iterrows()
-        ] or [
-            Div(text="""Done!""", width=200, height=100)
-        ]
+        ] or [Div(text="""Done!""", width=200, height=100)]
 
-    # def update_value(idx, label):
-    #     page_df.loc[idx, 'label'] = label
-    #     print(idx)
+    def change_all(new):
+        if new != '--':
+            for ci in c.children:
+                ci.children[-1].active = labels.index(new)
 
     def commit_values():
         for ci in c.children:
@@ -319,30 +436,30 @@ def get_time_series_tab(df, filt_df, labels, save, page_size=35):
             i = radio._event_index
             filt_df.loc[i, 'label'] = labels[radio.active]
 
-    def change_all():#attr, old, new
-        new = change_all_select.value
-        if new != '--':
-            # page_df['label'] = new
-            for ci in c.children:
-                ci.children[-1].active = labels.index(new)
-            # change_all_select.value = 0
+    def save_click():
+        commit_values()
+        save(filt_df.iloc[page*page_size:(page+1)*page_size])
+        set_page(page+1)
 
     prev_button = Button(label="back", button_type="default")
     next_button = Button(label=f"skip ({n_total})", button_type="primary")
     save_button = Button(label="submit >", button_type="success")
     change_all_select = Select(title="Assign Label To All:", value='--', options=['--', *labels])
     assign_button = Button(label="change all", button_type="warning")
-    # change_all_select.on_change('value', change_all)
-    prev_button.on_click(prev_click)
-    next_button.on_click(next_click)
+    change_all_select.on_change('value', lambda a,o,n: change_all(n))
+    prev_button.on_click(lambda: set_page(page-1))
+    next_button.on_click(lambda: set_page(page+1))
     save_button.on_click(save_click)
-    assign_button.on_click(change_all)
+    assign_button.on_click(lambda: change_all(change_all_select.value))
     set_page(0)
     refresh_plots()
 
     # Create a column with the plots for each event
     return column(
-        row(change_all_select, assign_button, save_button, prev_button, next_button),
+        row(
+            change_all_select, assign_button, save_button, prev_button, next_button,
+            styles={'align-items': 'flex-end'},
+        ),
         c,
         sizing_mode='stretch_width',
     )
@@ -352,8 +469,6 @@ def time_series_plot(df, event, labels):
     start_time = pd.to_datetime(event['start_time']).to_pydatetime() - timedelta(minutes=5)
     end_time = pd.to_datetime(event['end_time']).to_pydatetime() + timedelta(minutes=5)
     dfi = df.loc[event['deployment_id']].loc[start_time:end_time]
-
-
 
     # Create the plot with two lines: depth_filt_mm and depth_proc_mm
     p = figure(
@@ -370,9 +485,6 @@ def time_series_plot(df, event, labels):
 
     # Radio buttons for selecting event label
     radio_button_group = RadioButtonGroup(labels=labels, active=labels.index(event['label']))
-    # def update_radio(attr, old, new):
-    #     update_value(event.name, new)
-    # radio_button_group.on_change('active', update_radio)
     radio_button_group._event_index = event.name
     
     # Return the plot and the radio button group as a column
@@ -383,63 +495,120 @@ def time_series_plot(df, event, labels):
     )
 
 
+def ajax_time_series_plot(df, event, labels):
+    # Filter the time series data for the given event
+    start_time = pd.to_datetime(event['start_time']).to_pydatetime() - timedelta(minutes=10)
+    end_time = pd.to_datetime(event['end_time']).to_pydatetime() + timedelta(minutes=10)
 
-def stats_table(df, deployment_id_filter):
+    ts_source = GraphQLDataSource(
+        data_url=TIME_QUERY_CONFIG['url'],
+        query=TIME_QUERY_CONFIG['query'],
+        variables={
+            "deployment_id": event['deployment_id'],
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+        },
+        polling_interval=None, 
+        http_headers={'Access-Control-Allow-Origin': '*'},
+        adapter=CustomJS(code="""
+        let data = cb_data.response.data.depth_data
+
+        // row oriented to column oriented
+        data = [...new Set(data.flatMap(Object.keys))].reduce((result, key) => {
+            result[key] = data.map(row => row[key]);
+            return result;
+        }, {});
+
+        data.time = data.time.map(x => Date.parse(x));
+        console.log(data);
+        return data;
+        """)
+    )
+
+    # Create the plot with two lines: depth_filt_mm and depth_proc_mm
+    p = figure(
+        title=f"{event['deployment_id']}: {event['start_time']} ({event['end_time'] - event['start_time']})",
+        width_policy='max',
+        min_width=600,
+        height=200,
+        x_axis_type="datetime",
+        sizing_mode='stretch_width',
+        toolbar_location='above',
+        # tooltips=[('depth', '@y'), ('time', '@x')],
+        tooltips=[('depth', '@depth'), ('time', '@time')],
+    )
+    p.line('time', 'depth_filt_mm', source=ts_source, line_width=2, line_color='red', legend_label='filt')
+    p.line('time', 'depth_proc_mm', source=ts_source, line_width=2, line_color='blue', legend_label='proc')
+    p.ray(x=[event['start_time']], y=[0], length=0, angle=90, line_width=2, line_dash='dotted', line_color='#9370DB', angle_units='deg')
+    p.ray(x=[event['end_time']], y=[0], length=0, angle=90, line_width=2, line_dash='dotted', line_color='#9370DB', angle_units='deg')
+    p.y_range.only_visible = True
+    p.legend.click_policy="hide"
+    p.toolbar.logo = None
+
+    # Radio buttons for selecting event label
+    radio_button_group = RadioButtonGroup(labels=labels, active=labels.index(event['label']))
+    radio_button_group._event_index = event.name
+    
+    # Return the plot and the radio button group as a column
+    return column(
+        p,
+        radio_button_group,
+        sizing_mode='stretch_width',
+    )
+
+
+def stats_table(df, source, deployment_id_filter):
     # calculate stats
-    stat_df = df.groupby(['deployment_id', 'label']).size().unstack().fillna(0)#.sort_index(axis=1)
-    print(stat_df)
-    sort_cols = [x for x in ['?', 'flood'] if x in stat_df.columns]
-    if sort_cols:
-        stat_df.sort_values(sort_cols, ascending=False, inplace=True)
-
+    stat_df = df.groupby(['deployment_id', 'label']).size().unstack().fillna(0)
     stat_table = DataTable(
         source=ColumnDataSource(data=stat_df), 
         columns=[TableColumn(field=c, title=c)for c in stat_df.reset_index().columns], 
         width=600, 
         selectable='checkbox', 
         autosize_mode='force_fit', 
-        sizing_mode="stretch_width"
+        sizing_mode='stretch_width', 
+        styles={'flex-shrink': '1'},
+        index_position=None,
     )
 
-    # @debounce(0.2)
-    def update(attr, old, new):
-        print(attr, old, new)
-        # deployment_id_filter.booleans = df.deployment_id.isin(stat_df.index[new])
-        deployment_id_filter.operands = [multi_group_filter("deployment_id", stat_df.index[new])]
-    stat_table.source.selected.on_change("indices", update)
+    # # @debounce(0.2)
+    # def update(attr, old, new):
+    #     print(attr, old, new)
+    #     deployment_id_filter.operands = [multi_group_filter("deployment_id", stat_df.index[new])]
+    # stat_table.source.selected.on_change("indices", update)
+    stat_table.source.selected.js_on_change('indices',  CustomJS(
+        args=dict(source=source, stat_source=stat_table.source, f=deployment_id_filter),
+        code="""
+        const selected = cb_obj.indices.map(idx => stat_source.data.deployment_id[idx]);
+        f.booleans = selected.length ? source.data.deployment_id.map(l => selected.includes(l)) : null;
+        """))
     return stat_table
 
 
-
-
 def embedding_plot(df, source, view, active_view, labels, update_selection):
-    cols = df.columns.tolist()
-    x_col = Select(title="X:", value='x' if 'x' in cols else cols[0], options=cols)
-    y_col = Select(title="Y:", value='y' if 'y' in cols else cols[1], options=cols)
-
     p = figure(
         title="",
         width=600,
         height=500,
-        # sizing_mode="scale_both",
-        # sizing_mode="fixed",
-        # sizing_mode="scale_width",
         sizing_mode="stretch_width",
         tools=[
             # "lasso_select",
             # "box_select",
-            # "pan",
-            # "box_zoom",
+            "pan",
+            "box_zoom",
             "wheel_zoom",
             "reset",
         ],
-        # active_drag="lasso_select",
+        x_axis_type=None,
+        y_axis_type=None,
         output_backend="webgl",
-        toolbar_location='below',
+        toolbar_location='above',
         tooltips=[('deployment_id', '@deployment_id'), ('start_time', '@start_time'), ('end_time', '@end_time'), ('label', '@label')]
     )
+    p.toolbar.autohide = True
 
     colors = list(Category10[len(labels)])
+    # "#010026"
     colors = ["grey" if l == '?' else c for l, c in zip(labels, colors)]
     colormap = factor_cmap(
         field_name="label",
@@ -447,68 +616,71 @@ def embedding_plot(df, source, view, active_view, labels, update_selection):
         factors=labels,
         nan_color="grey",
     )
-    if "color" in df.columns:
-        color_bar = ColorBar(color_mapper=colormap["transform"], height=8)
-        p.add_layout(color_bar, "below")
+    color_bar = ColorBar(color_mapper=colormap["transform"], height=8)
+    p.add_layout(color_bar, "below")
 
-    # scatter = p.scatter(**{
-    #     "x": "x",
-    #     "y": "y",
-    #     "size": 7,
-    #     "source": source,
-    #     "view": view,
-    #     "alpha": 0.6,
-    #     # "line_color": "yellow",
-    #     **circle_kwargs,
-    # })
-    reference = p.scatter(**{
-        "x": "x",
-        "y": "y",
-        "size": 7,
-        # 'fill_color': None,
-        "source": source,
-        "view": CDSView(filter=(~active_view.filter) & view.filter),
-        "alpha": 0.3,
-        "color": colormap,
-    })
-    active = p.scatter(**{
-        "x": "x",
-        "y": "y",
-        "size": 7,
-        "source": source,
-        "view": CDSView(filter=active_view.filter & view.filter),
-        # "view": view,
-        "alpha": 0.6,
-        # "color": colormap,
-        "color": colormap
-    })
+    reference = p.scatter(
+        x="x", y="y",
+        size=7,
+        source=source,
+        view=CDSView(filter=(~active_view.filter) & view.filter),
+        alpha=0.4,
+        color=colormap,
+        line_color=None,
+    )
+    active = p.scatter(
+        x="x", y="y",
+        size=11,
+        source=source,
+        view=CDSView(filter=active_view.filter & view.filter),
+        alpha=0.4,
+        color=colormap,
+        # line_color=None,
+        line_color='black',
+        selection_line_color="#ff1141",
+        selection_alpha=0.7,
+        selection_line_width=3,
+        hover_fill_color="midnightblue", hover_alpha=0.5,
+        hover_line_color="white",
+    )
 
-    def chx(a, o, x): 
-        reference.glyph.x=x
-        active.glyph.x=x
-        # scatter.glyph.x=x
-    def chy(a, o, x): 
-        reference.glyph.y=x
-        active.glyph.y=x
-        # scatter.glyph.y=x
-    # x_col.js_link('value', reference.glyph, 'x')
-    # y_col.js_link('value', reference.glyph, 'y')
-    # x_col.js_link('value', active.glyph, 'x')
-    # y_col.js_link('value', active.glyph, 'y')
-    x_col.on_change('value', chx)
-    y_col.on_change('value', chy)
+    cols = df.columns.tolist()
+    x_col = Select(title="X:", value='x' if 'x' in cols else cols[0], options=cols, styles={'max-width': '6em'})
+    y_col = Select(title="Y:", value='y' if 'y' in cols else cols[1], options=cols, styles={'max-width': '6em'})
+    x_col.js_on_change('value', CustomJS(args=dict(g=reference.glyph),code="g.x = {field: this.value}"))
+    x_col.js_on_change('value', CustomJS(args=dict(g=active.glyph),code="g.x = {field: this.value}"))
+    y_col.js_on_change('value', CustomJS(args=dict(g=reference.glyph),code="g.y = {field: this.value}"))
+    y_col.js_on_change('value', CustomJS(args=dict(g=active.glyph),code="g.y = {field: this.value}"))
 
-    # scatter.data_source.selected.on_change("indices", update_selection)
+    # polygon = PolyAnnotation(fill_color="blue", fill_alpha=0.2)
+    # p.add_layout(polygon)
+
     active.data_source.selected.on_change("indices", update_selection)
-    # active.data_source.selected.on_change("indices", lambda a,o,n: print(a, len(o), len(n)))
-    options = row(x_col, y_col)
 
-    lasso = LassoSelectTool(renderers=[active])
+    select = figure(
+                height=40, 
+                x_axis_type=None, y_axis_type=None, output_backend="webgl", lod_factor=50,
+                tools="", toolbar_location=None, sizing_mode='stretch_width')
+    select.scatter(x="x", y="y", source=source, view=view, alpha=0.6, line_color=None, fill_color=colormap)
+    range_tool = RangeTool(x_range=p.x_range, y_range=p.y_range)
+    range_tool.overlay.fill_color = "navy"
+    range_tool.overlay.fill_alpha = 0.2
+    select.add_tools(range_tool)
+
+    # range_tool = RangeTool(x_range=p.x_range)
+    # range_tool.overlay.fill_color = "navy"
+    # range_tool.overlay.fill_alpha = 0.2
+    # p.add_tools(range_tool)
+    lasso = LassoSelectTool(
+        # overlay=PolyAnnotation(),
+        renderers=[active])
     p.add_tools(lasso)
     p.toolbar.active_drag = lasso
-    # p.tools[0].renderers = [active]
+    p.toolbar.active_inspect = None
+    p.toolbar.logo = None
 
-    return options, p
+    options = row(x_col, y_col)
+    return options, column(p, select, sizing_mode='stretch_width')
 
 
 def file_download(source, save, download):
